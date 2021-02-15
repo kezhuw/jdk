@@ -48,6 +48,7 @@ import java.util.stream.StreamSupport;
 import sun.nio.cs.UTF_8;
 
 import jdk.internal.loader.BootLoader;
+import jdk.internal.loader.ClassLoaderUtil;
 import jdk.internal.loader.ClassLoaders;
 import jdk.internal.access.JavaLangAccess;
 import jdk.internal.access.SharedSecrets;
@@ -406,6 +407,9 @@ public final class ServiceLoader<S>
     // null when locating provider using a module layer
     private final ClassLoader loader;
 
+    // Whether includes providers from ancestor layers or class loaders.
+    private final boolean ancestors;
+
     // The access control context taken when the ServiceLoader is created
     private final AccessControlContext acc;
 
@@ -484,6 +488,7 @@ public final class ServiceLoader<S>
         this.serviceName = svc.getName();
         this.layer = layer;
         this.loader = null;
+        this.ancestors = true;
         this.acc = (System.getSecurityManager() != null)
                 ? AccessController.getContext()
                 : null;
@@ -491,13 +496,13 @@ public final class ServiceLoader<S>
 
     /**
      * Initializes a new instance of this class for locating service providers
-     * via a class loader.
+     * via a class loader, and its ancestor class loaders if ancestors is true.
      *
      * @throws ServiceConfigurationError
      *         If {@code svc} is not accessible to {@code caller} or the caller
      *         module does not use the service type.
      */
-    private ServiceLoader(Class<?> caller, Class<S> svc, ClassLoader cl) {
+    private ServiceLoader(Class<?> caller, Class<S> svc, ClassLoader cl, boolean ancestors) {
         Objects.requireNonNull(svc);
 
         if (VM.isBooted()) {
@@ -525,9 +530,22 @@ public final class ServiceLoader<S>
         this.serviceName = svc.getName();
         this.layer = null;
         this.loader = cl;
+        this.ancestors = ancestors;
         this.acc = (System.getSecurityManager() != null)
                 ? AccessController.getContext()
                 : null;
+    }
+
+    /**
+     * Initializes a new instance of this class for locating service providers
+     * via a class loader and its ancestors.
+     *
+     * @throws ServiceConfigurationError
+     *         If {@code svc} is not accessible to {@code caller} or the caller
+     *         module does not use the service type.
+     */
+    private ServiceLoader(Class<?> caller, Class<S> svc, ClassLoader cl) {
+        this(caller, svc, cl, true);
     }
 
     /**
@@ -548,6 +566,7 @@ public final class ServiceLoader<S>
         this.serviceName = svc.getName();
         this.layer = null;
         this.loader = cl;
+        this.ancestors = true;
         this.acc = (System.getSecurityManager() != null)
                 ? AccessController.getContext()
                 : null;
@@ -934,11 +953,13 @@ public final class ServiceLoader<S>
                         return false;
 
                     ModuleLayer layer = stack.pop();
-                    List<ModuleLayer> parents = layer.parents();
-                    for (int i = parents.size() - 1; i >= 0; i--) {
-                        ModuleLayer parent = parents.get(i);
-                        if (visited.add(parent)) {
-                            stack.push(parent);
+                    if (ancestors) {
+                        List<ModuleLayer> parents = layer.parents();
+                        for (int i = parents.size() - 1; i >= 0; i--) {
+                            ModuleLayer parent = parents.get(i);
+                            if (visited.add(parent)) {
+                                stack.push(parent);
+                            }
                         }
                     }
                     iterator = providers(layer);
@@ -1063,9 +1084,11 @@ public final class ServiceLoader<S>
                 while (!iterator.hasNext()) {
                     if (currentLoader == null) {
                         return false;
-                    } else {
+                    } else if (ancestors) {
                         currentLoader = currentLoader.getParent();
                         iterator = iteratorFor(currentLoader);
+                    } else {
+                        return false;
                     }
                 }
 
@@ -1182,17 +1205,19 @@ public final class ServiceLoader<S>
                 try {
                     String fullName = PREFIX + service.getName();
                     if (loader == null) {
-                        configs = ClassLoader.getSystemResources(fullName);
+                        configs = BootLoader.findResources(fullName);
                     } else if (loader == ClassLoaders.platformClassLoader()) {
                         // The platform classloader doesn't have a class path,
                         // but the boot loader might.
-                        if (BootLoader.hasClassPath()) {
+                        if (ancestors && BootLoader.hasClassPath()) {
                             configs = BootLoader.findResources(fullName);
                         } else {
                             configs = Collections.emptyEnumeration();
                         }
-                    } else {
+                    } else if (ancestors) {
                         configs = loader.getResources(fullName);
+                    } else {
+                        configs = ClassLoaderUtil.findResources(loader, fullName);
                     }
                 } catch (IOException x) {
                     fail(service, "Error locating configuration files", x);
@@ -1641,6 +1666,39 @@ public final class ServiceLoader<S>
                                             ClassLoader loader)
     {
         return new ServiceLoader<>(Reflection.getCallerClass(), service, loader);
+    }
+
+    /**
+     * Same as {@link #load(Class, ClassLoader)} but with additional control
+     * whether go through ancestor class loaders.
+     *
+     * @param  <S> the class of the service type
+     *
+     * @param  service
+     *         The interface or abstract class representing the service
+     *
+     * @param  loader
+     *         The class loader to be used to load provider-configuration files
+     *         and provider classes, or {@code null} if the system class
+     *         loader (or, failing that, the bootstrap class loader) is to be
+     *         used
+     *
+     * @param ancestors whether go through ancestor class loaders
+     *
+     * @return A new service loader
+     *
+     * @throws ServiceConfigurationError
+     *         if the service type is not accessible to the caller or the
+     *         caller is in an explicit module and its module descriptor does
+     *         not declare that it uses {@code service}
+     * @since 1x
+     */
+    @CallerSensitive
+    public static <S> ServiceLoader<S> load(Class<S> service,
+                                            ClassLoader loader,
+                                            boolean ancestors)
+    {
+        return new ServiceLoader<>(Reflection.getCallerClass(), service, loader, ancestors);
     }
 
     /**

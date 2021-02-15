@@ -166,6 +166,7 @@ module java.base {
         java.instrument,
         java.logging,
         java.naming,
+        java.sql,
         jdk.incubator.foreign;
     exports jdk.internal.jmod to
         jdk.compiler,
